@@ -1,92 +1,86 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
+from torchvision import transforms
+import numpy as np
 from tqdm import tqdm
 import os
 
-def load_transforms():
-    """
-    Load the data transformations
-    """
-    return transforms.Compose([
-        transforms.Resize((32, 32)),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-    ])
 
-def load_data(data_dir, batch_size):
+def create_data_loaders(train_dataset, test_dataset, batch_size, validation_split=0.2, seed=42):
     """
-    Load the data from the data directory and split it into training and validation sets
-    This function is similar to the cell 2. Data Preparation in 04_model_training.ipynb
-
-    Args:
-        data_dir: The directory to load the data from
-        batch_size: The batch size to use for the data loaders
-    Returns:
-        train_loader: The training data loader
-        val_loader: The validation data loader
+    Create train/val/test data loaders without data leakage
+    Split is done BEFORE any augmentation
     """
-    # Define data transformations: resize, convert to tensor, and normalize
-    data_transforms = load_transforms()
+    # Set seed for reproducible splitting
+    np.random.seed(seed)
 
-    # Load the full dataset from the augmented data directory
-    full_dataset = datasets.ImageFolder(root=data_dir, transform=data_transforms)
+    # Get indices for splitting
+    dataset_size = len(train_dataset)
+    indices = list(range(dataset_size))
+    np.random.shuffle(indices)
 
-    # Split the dataset into training and validation sets (80/20 split)
-    train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator()
+    split_idx = int(np.floor(validation_split * dataset_size))
+    train_indices, val_indices = indices[split_idx:], indices[:split_idx]
+
+    # Create subsets
+    train_subset = Subset(train_dataset, train_indices)
+    val_subset = Subset(train_dataset, val_indices)
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_subset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
     )
 
-    # Create data loaders for training and validation
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
-    # Print dataset summary
-    print(f"Dataset loaded from: {data_dir}")
-    print(f"Total images: {len(full_dataset)}")
-    print(f"Number of classes: {len(full_dataset.classes)}")
-    print(f"Class names: {full_dataset.classes}")
-    print(f"Training set size: {len(train_dataset)}")
-    print(f"Validation set size: {len(val_dataset)}")
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
-    return train_loader, val_loader
+    print(f"Data split - Train: {len(train_subset)}, Val: {len(val_subset)}, Test: {len(test_dataset)}")
+
+    return train_loader, val_loader, test_loader
 
 
 def define_loss_and_optimizer(model: nn.Module, lr: float, weight_decay: float):
     """
-    Define the loss function and optimizer
-    This function is similar to the cell 3. Model Configuration in 04_model_training.ipynb
-    Args:
-        model: The model to train
-        lr: Learning rate
-        weight_decay: Weight decay
-    Returns:
-        criterion: The loss function
-        optimizer: The optimizer
-        scheduler: The scheduler
+    Define optimized loss function and optimizer
     """
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay, eps=1e-4)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=80,
+        steps_per_epoch=1000,  # Will be updated during training
+        pct_start=0.1,
+        anneal_strategy='cos'
+    )
     return criterion, optimizer, scheduler
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, scheduler, device):
     """
-    Train the model for one epoch
-    Args:
-        model: The model to train
-        dataloader: DataLoader for training data
-        criterion: Loss function
-        optimizer: Optimizer
-        device: Device to train on
-    Returns:
-        Average loss and accuracy for the epoch
+    Train the model for one epoch with optimized settings
     """
     model.train()
     running_loss = 0.0
@@ -96,18 +90,23 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     progress_bar = tqdm(dataloader, desc="Training", leave=False)
 
     for inputs, labels in progress_bar:
-        inputs, labels = inputs.to(device), labels.to(device)
+        inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
-        # Zero the parameter gradients
-        optimizer.zero_grad()
+        # Zero gradients
+        optimizer.zero_grad(set_to_none=True)
 
         # Forward pass
         outputs = model(inputs)
         loss = criterion(outputs, labels)
 
-        # Backward pass and optimize
+        # Backward pass
         loss.backward()
+
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
+        scheduler.step()
 
         # Statistics
         running_loss += loss.item() * inputs.size(0)
@@ -129,13 +128,6 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
 def validate_epoch(model, dataloader, criterion, device):
     """
     Validate the model
-    Args:
-        model: The model to validate
-        dataloader: DataLoader for validation data
-        criterion: Loss function
-        device: Device to validate on
-    Returns:
-        Average loss and accuracy for the validation set
     """
     model.eval()
     running_loss = 0.0
@@ -146,7 +138,7 @@ def validate_epoch(model, dataloader, criterion, device):
         progress_bar = tqdm(dataloader, desc="Validation", leave=False)
 
         for inputs, labels in progress_bar:
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
             # Forward pass
             outputs = model(inputs)
@@ -169,27 +161,39 @@ def validate_epoch(model, dataloader, criterion, device):
     return epoch_loss, epoch_acc
 
 
+def evaluate_model(model, dataloader, criterion, device):
+    """
+    Evaluate model on test set (for periodic testing during training)
+    """
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+
+            running_loss += loss.item() * inputs.size(0)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+
+    epoch_loss = running_loss / total
+    epoch_acc = 100.0 * correct / total
+
+    return epoch_loss, epoch_acc
+
+
 def save_checkpoint(state, filename):
-    """
-    Save model checkpoint
-    Args:
-        state: Checkpoint state
-        filename: Path to save checkpoint
-    """
+    """Save model checkpoint"""
     torch.save(state, filename)
 
 
 def load_checkpoint(filename, model, optimizer=None, scheduler=None):
-    """
-    Load model checkpoint
-    Args:
-        filename: Path to checkpoint file
-        model: Model to load weights into
-        optimizer: Optimizer to load state into (optional)
-        scheduler: Scheduler to load state into (optional)
-    Returns:
-        Checkpoint state
-    """
+    """Load model checkpoint"""
     if not os.path.isfile(filename):
         raise FileNotFoundError(f"Checkpoint file {filename} not found")
 
@@ -203,13 +207,3 @@ def load_checkpoint(filename, model, optimizer=None, scheduler=None):
         scheduler.load_state_dict(checkpoint["scheduler"])
 
     return checkpoint
-
-def save_metrics(metrics: str, filename: str = "training_metrics.txt"):
-    """
-    Save training metrics to a file
-    Args:
-        metrics: Metrics string to save
-        filename: Path to save metrics
-    """
-    with open(filename, 'w') as f:
-        f.write(metrics)
